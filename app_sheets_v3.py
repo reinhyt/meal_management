@@ -22,10 +22,22 @@ class UltimateSheetsDietAppV4:
         self.presets = {}
         self.history = {}
         
-        if os.path.exists(CREDENTIALS_FILE) and SPREADSHEET_ID != "ここにあなたのスプレッドシートIDを貼り付けてください":
+        # Streamlit CloudのSecrets（クラウド）とローカルファイルを自動判別
+        creds_info = None
+        if "gcp_service_account" in st.secrets:
+            try:
+                creds_info = json.loads(st.secrets["gcp_service_account"])
+            except Exception:
+                creds_info = st.secrets["gcp_service_account"]
+        elif os.path.exists(CREDENTIALS_FILE):
+            with open(CREDENTIALS_FILE, "r") as f:
+                creds_info = json.load(f)
+
+        if creds_info and SPREADSHEET_ID != "ここにあなたのスプレッドシートIDを貼り付けてください":
             try:
                 scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-                creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+                # from_service_account_file ではなく from_service_account_info を使用
+                creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
                 self.gc = gspread.authorize(creds)
                 self.sh = self.gc.open_by_key(SPREADSHEET_ID)
                 self.load_data_from_sheets()
