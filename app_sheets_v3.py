@@ -14,6 +14,12 @@ CREDENTIALS_FILE = "credentials.json"
 # 💡 ここにご自身のスプレッドシートIDを確実に貼り付けてください
 SPREADSHEET_ID = "18hsGix3rrv2QSVtfkrPaSwxLHUuiS1noczGqRUBrh-0"
 
+# 💡 トレーニングメニュー定義(種目, セット数)
+TRAINING_PLAN = {
+    "A": [("チェストプレス", 3), ("ショルダープレス", 2), ("レッグプレス", 4), ("ディップス", 1), ("腹筋マシン", 2)],
+    "B": [("ラットプルダウン", 4), ("アブダクション", 4), ("アームカール", 2), ("腹筋マシン", 2)],
+}
+
 class UltimateSheetsDietAppV4:
     def __init__(self):
         self.target = {"calories": 2000, "protein": 120, "fat": 50, "carbohydrate": 255, "salt": 7.0}
@@ -21,6 +27,7 @@ class UltimateSheetsDietAppV4:
         self.food_master = {}
         self.presets = {}
         self.history = {}
+        self.training_df = pd.DataFrame(columns=["日付", "Day", "種目", "セット", "重量(kg)", "回数"])
         
         # Streamlit CloudのSecrets（クラウド）とローカルファイルを自動判別
         creds_info = None
@@ -45,6 +52,7 @@ class UltimateSheetsDietAppV4:
                 creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
                 self.gc = gspread.authorize(creds)
                 self.sh = self.gc.open_by_key(SPREADSHEET_ID)
+                self.migrate_history_if_needed()
                 self.load_data_from_sheets()
             except Exception as e:
                 st.error(f"⚠️ スプレッドシートへの接続に失敗しました: {e}")
@@ -63,7 +71,10 @@ class UltimateSheetsDietAppV4:
             h_data = []
             try: h_data = sh.worksheet("history").get_all_records()
             except Exception: pass
-            return {"master": m_data, "target_preset": tp_data, "history": h_data}
+            tr_data = []
+            try: tr_data = sh.worksheet("training").get_all_records()
+            except Exception: pass
+            return {"master": m_data, "target_preset": tp_data, "history": h_data, "training": tr_data}
 
         if st.session_state.get("clear_cache", False):
             st.cache_data.clear()
@@ -88,15 +99,33 @@ class UltimateSheetsDietAppV4:
                     loaded = json.loads(r['データ'])
                     if "salt" not in loaded: loaded["salt"] = 7.0
                     self.target = loaded
-            self.history = {}
-            for r in raw["history"]: 
-                data = json.loads(r['データ'])
-                if "intake_by_slot" in data:
-                    for slot in self.slots:
-                        if slot in data["intake_by_slot"] and "salt" not in data["intake_by_slot"][slot]:
-                            data["intake_by_slot"][slot]["salt"] = 0.0
-                self.history[r['日付']] = data
+            self.history = self.build_history_dict_from_rows(raw["history"])
+            self.training_df = pd.DataFrame(raw["training"]) if raw["training"] else pd.DataFrame(
+                columns=["日付", "Day", "種目", "セット", "重量(kg)", "回数"])
         except Exception as e: st.error(f"⚠️ データ同期エラー: {e}")
+
+    def build_history_dict_from_rows(self, records):
+        """食事履歴シート(1食材=1行)から表示用の辞書を組み立てる。"""
+        hist = {}
+        for r in records:
+            d = str(r.get('日付', '')).strip()
+            slot = r.get('時間帯', '')
+            if not d or slot not in self.slots: continue
+            if d not in hist:
+                hist[d] = {
+                    "meals_by_slot": {s: [] for s in self.slots},
+                    "intake_by_slot": {s: {"calories": 0.0, "protein": 0.0, "fat": 0.0, "carbohydrate": 0.0, "salt": 0.0} for s in self.slots}
+                }
+            qty, unit, name = r.get('数量', ''), r.get('単位', ''), r.get('食材名', '')
+            label = f"{name}({qty}{unit})" if qty not in ('', None) and unit not in ('', None) else str(name)
+            hist[d]["meals_by_slot"][slot].append(label)
+            intake = hist[d]["intake_by_slot"][slot]
+            intake["calories"] += float(r.get('カロリー', 0) or 0)
+            intake["protein"] += float(r.get('タンパク質', 0) or 0)
+            intake["fat"] += float(r.get('脂質', 0) or 0)
+            intake["carbohydrate"] += float(r.get('炭水化物', 0) or 0)
+            intake["salt"] += float(r.get('塩分', 0) or 0)
+        return hist
 
     def trigger_refresh(self): st.session_state["clear_cache"] = True
 
@@ -124,16 +153,54 @@ class UltimateSheetsDietAppV4:
             self.trigger_refresh()
         except Exception: pass
 
-    def save_history_to_sheets(self):
+    def append_history_rows(self, rows):
+        """rows: [[日付,時間帯,食材名,数量,単位,カロリー,タンパク質,脂質,炭水化物,塩分], ...]
+        1回のAPI呼び出しでまとめて追記する。"""
+        if not hasattr(self, 'sh'): return False
+        try:
+            try: sheet = self.sh.worksheet("history")
+            except Exception:
+                sheet = self.sh.add_worksheet(title="history", rows="2000", cols="10")
+                sheet.append_row(["日付", "時間帯", "食材名", "数量", "単位", "カロリー", "タンパク質", "脂質", "炭水化物", "塩分"])
+            sheet.append_rows(rows)
+            self.trigger_refresh()
+            return True
+        except Exception as e:
+            st.error(f"⚠️ 記録の保存に失敗しました: {e}")
+            return False
+
+    def migrate_history_if_needed(self):
+        """旧形式(日付・データ(JSON))のhistoryシートを、日付・時間帯ごとの表形式に1回だけ自動変換する。
+        旧データは時間帯ごとの合計値までしか復元できないため、食材の内訳は結合した文字列として残す。"""
         if not hasattr(self, 'sh'): return
+        new_header = ["日付", "時間帯", "食材名", "数量", "単位", "カロリー", "タンパク質", "脂質", "炭水化物", "塩分"]
         try:
             sheet = self.sh.worksheet("history")
-            sheet.clear()
-            sheet.append_row(['日付', 'データ'])
-            for d_str, data in self.history.items():
-                sheet.append_row([d_str, json.dumps(data, ensure_ascii=False)])
-            self.trigger_refresh()
-        except Exception: pass
+        except Exception:
+            return
+        try:
+            values = sheet.get_all_values()
+        except Exception:
+            return
+        if not values or values[0] == new_header: return
+        new_rows = []
+        for row in values[1:]:
+            if len(row) < 2 or not row[1]: continue
+            try: data = json.loads(row[1])
+            except Exception: continue
+            d_str = row[0]
+            meals_by_slot = data.get("meals_by_slot", {})
+            intake_by_slot = data.get("intake_by_slot", {})
+            for slot in self.slots:
+                meals = meals_by_slot.get(slot, [])
+                if not meals: continue
+                intake = intake_by_slot.get(slot, {})
+                new_rows.append([d_str, slot, "、".join(meals), "", "",
+                                  intake.get("calories", 0), intake.get("protein", 0),
+                                  intake.get("fat", 0), intake.get("carbohydrate", 0), intake.get("salt", 0)])
+        sheet.clear()
+        sheet.append_row(new_header)
+        if new_rows: sheet.append_rows(new_rows)
 
     def log_weight_fat(self, date_str, weight, fat):
         try:
@@ -186,23 +253,28 @@ class UltimateSheetsDietAppV4:
         self.save_target_preset_to_sheets()
 
     def log_single_item(self, d_str, slot, name, amount):
-        self.init_day_if_needed(d_str)
-        if name in self.food_master:
-            m = self.food_master[name]
-            f = (amount / 100.0) if m["unit_type"] == "g" else amount
-            day = self.history[d_str]
-            day["intake_by_slot"][slot]["calories"] += m["calories"] * f
-            day["intake_by_slot"][slot]["protein"] += m["protein"] * f
-            day["intake_by_slot"][slot]["fat"] += m["fat"] * f
-            day["intake_by_slot"][slot]["carbohydrate"] += m["carbohydrate"] * f
-            day["intake_by_slot"][slot]["salt"] += m.get("salt", 0.0) * f
-            u = f"{amount}g" if m["unit_type"] == "g" else f"{amount}個"
-            day["meals_by_slot"][slot].append(f"{name}({u})")
-            self.save_history_to_sheets()
+        if name not in self.food_master: return
+        m = self.food_master[name]
+        f = (amount / 100.0) if m["unit_type"] == "g" else amount
+        unit_label = "g" if m["unit_type"] == "g" else "個"
+        row = [d_str, slot, name, amount, unit_label,
+               round(m["calories"] * f, 1), round(m["protein"] * f, 1),
+               round(m["fat"] * f, 1), round(m["carbohydrate"] * f, 1), round(m.get("salt", 0.0) * f, 2)]
+        self.append_history_rows([row])
 
     def log_preset_meal(self, d_str, slot, p_name):
-        if p_name in self.presets:
-            for item in self.presets[p_name]: self.log_single_item(d_str, slot, item["name"], item["amount"])
+        if p_name not in self.presets: return
+        rows = []
+        for item in self.presets[p_name]:
+            name, amount = item["name"], item["amount"]
+            if name not in self.food_master: continue
+            m = self.food_master[name]
+            f = (amount / 100.0) if m["unit_type"] == "g" else amount
+            unit_label = "g" if m["unit_type"] == "g" else "個"
+            rows.append([d_str, slot, name, amount, unit_label,
+                         round(m["calories"] * f, 1), round(m["protein"] * f, 1),
+                         round(m["fat"] * f, 1), round(m["carbohydrate"] * f, 1), round(m.get("salt", 0.0) * f, 2)])
+        if rows: self.append_history_rows(rows)
 
     def get_recent_foods(self, limit=10):
         cts = {}
@@ -212,6 +284,33 @@ class UltimateSheetsDietAppV4:
                     rn = m.split("(")[0]
                     if rn in self.food_master: cts[rn] = cts.get(rn, 0) + 1
         return [f[0] for f in sorted(cts.items(), key=lambda x:x[1], reverse=True)[:limit]]
+
+    def log_training(self, date_str, day_type, entries):
+        """entries: [{"exercise":..., "set_no":..., "weight":..., "reps":...}, ...]
+        1日分をまとめて1回のAPI呼び出し(append_rows)で追記する。"""
+        if not hasattr(self, 'sh'): return False
+        try:
+            try:
+                sheet = self.sh.worksheet("training")
+            except Exception:
+                sheet = self.sh.add_worksheet(title="training", rows="1000", cols="6")
+                sheet.append_row(["日付", "Day", "種目", "セット", "重量(kg)", "回数"])
+            rows = [[date_str, day_type, e["exercise"], e["set_no"], e["weight"], e["reps"]] for e in entries]
+            sheet.append_rows(rows)
+            self.trigger_refresh()
+            return True
+        except Exception as e:
+            st.error(f"⚠️ トレーニング記録の保存に失敗しました: {e}")
+            return False
+
+    def get_training_dataframe(self):
+        df = self.training_df
+        if df is None or df.empty: return None
+        df = df.copy()
+        df['日付'] = pd.to_datetime(df['日付'])
+        for col in ['セット', '重量(kg)', '回数']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df.sort_values('日付').reset_index(drop=True)
 
 app = UltimateSheetsDietAppV4()
 
@@ -229,7 +328,7 @@ total = {"calories":0.0,"protein":0.0,"fat":0.0,"carbohydrate":0.0,"salt":0.0}
 for s in app.slots:
     for k in total: total[k] += day_data["intake_by_slot"][s].get(k, 0.0)
 
-tab_main, tab_graph = st.tabs(["📝 今日の記録・食事明細", "📈 体重・体脂肪トレンドグラフ"])
+tab_main, tab_training, tab_graph = st.tabs(["📝 今日の記録・食事明細", "🏋️ トレーニング記録", "📈 トレンドグラフ"])
 
 with tab_main:
     col1, col2 = st.columns([3, 2])
@@ -326,22 +425,10 @@ with tab_main:
                 
                 if st.form_submit_button("スポット食事を記録する", type="primary"):
                     if spot_name:
-                        # 💡 既存の仕組み（app.food_master）を汚さずに、今日の日付データに直接栄養素を加算する処理
-                        app.init_day_if_needed(sel_date)
-                        day = app.history[sel_date]
-                        
-                        day["intake_by_slot"][spot_slot]["calories"] += spot_cal
-                        day["intake_by_slot"][spot_slot]["protein"] += spot_p
-                        day["intake_by_slot"][spot_slot]["fat"] += spot_f
-                        day["intake_by_slot"][spot_slot]["carbohydrate"] += spot_c
-                        day["intake_by_slot"][spot_slot]["salt"] += spot_s
-                        
-                        # 明細には「メニュー名」をそのまま突っ込む
-                        day["meals_by_slot"][spot_slot].append(f"{spot_name}")
-                        app.save_history_to_sheets()
-                        
-                        st.success(f"✅ 『{spot_name}』をスポット記録しました！")
-                        st.rerun()
+                        row = [sel_date, spot_slot, spot_name, "", "", spot_cal, spot_p, spot_f, spot_c, spot_s]
+                        if app.append_history_rows([row]):
+                            st.success(f"✅ 『{spot_name}』をスポット記録しました！")
+                            st.rerun()
                     else:
                         st.error("メニュー名を入力してください。")
 
@@ -396,6 +483,52 @@ with tab_main:
                 app.save_target_preset_to_sheets()
                 st.success("✅ クラウドの目標値を更新しました！")
                 st.rerun()
+
+with tab_training:
+    st.subheader(f"🏋️ {sel_date} のトレーニング記録")
+    day_type = st.radio("今日のメニュー", ["A", "B"], horizontal=True,
+                         format_func=lambda d: f"Day {d}（" + "・".join(n for n, _ in TRAINING_PLAN[d]) + "）",
+                         key="train_day_type")
+
+    with st.form("training_log"):
+        inputs = {}
+        for ex_name, n_sets in TRAINING_PLAN[day_type]:
+            st.markdown(f"**{ex_name}**")
+            cols = st.columns(n_sets)
+            for i in range(n_sets):
+                with cols[i]:
+                    w = st.number_input(f"{i+1}セット目 重量(kg)", min_value=0.0, step=0.5,
+                                         key=f"w_{day_type}_{ex_name}_{i}")
+                    r = st.number_input(f"{i+1}セット目 回数", min_value=0, step=1,
+                                         key=f"r_{day_type}_{ex_name}_{i}")
+                    inputs[(ex_name, i + 1)] = (w, r)
+        if st.form_submit_button("この日のトレーニングを記録する", type="primary"):
+            entries = [
+                {"exercise": ex, "set_no": set_no, "weight": w, "reps": r}
+                for (ex, set_no), (w, r) in inputs.items() if w > 0 or r > 0
+            ]
+            if entries and app.log_training(sel_date, day_type, entries):
+                st.success("✅ トレーニングを記録しました！")
+                st.rerun()
+            elif not entries:
+                st.warning("重量か回数を1つ以上入力してください。")
+
+    st.markdown("---")
+    st.subheader("📈 種目別・重量の推移")
+    tr_df = app.get_training_dataframe()
+    if tr_df is not None and not tr_df.empty:
+        ex_list = sorted(tr_df['種目'].unique())
+        sel_ex = st.selectbox("種目を選択", ex_list)
+        ex_df = tr_df[tr_df['種目'] == sel_ex]
+        # その日の最大重量(トップセット)を日付ごとに集計 → 漸進的過負荷の確認用
+        top_set = ex_df.groupby('日付')['重量(kg)'].max().reset_index()
+        fig = px.line(top_set, x='日付', y='重量(kg)', markers=True)
+        fig.update_layout(margin=dict(l=10, r=10, t=5, b=5), height=300)
+        st.plotly_chart(fig, use_container_width=True, key=f"train_trend_{sel_ex}")
+        with st.expander("記録の詳細を見る"):
+            st.dataframe(ex_df.sort_values('日付', ascending=False), use_container_width=True, hide_index=True)
+    else:
+        st.info("まだトレーニング記録がありません。上のフォームから記録してください。")
 
 with tab_graph:
     body_df = app.get_body_dataframe()
