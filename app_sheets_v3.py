@@ -40,6 +40,7 @@ class UltimateSheetsDietAppV4:
         self.food_master = {}
         self.presets = {}
         self.history = {}
+        self.history_records = []
         self.training_df = pd.DataFrame(columns=["日付", "Day", "種目", "セット", "重量(kg)", "回数"])
         
         # Streamlit CloudのSecrets（クラウド）とローカルファイルを自動判別
@@ -113,6 +114,7 @@ class UltimateSheetsDietAppV4:
                     if "salt" not in loaded: loaded["salt"] = 7.0
                     self.target = loaded
             self.history = self.build_history_dict_from_rows(raw["history"])
+            self.history_records = raw["history"]
             self.training_df = pd.DataFrame(raw["training"]) if raw["training"] else pd.DataFrame(
                 columns=["日付", "Day", "種目", "セット", "重量(kg)", "回数"])
         except Exception as e: st.error(f"⚠️ データ同期エラー: {e}")
@@ -139,6 +141,16 @@ class UltimateSheetsDietAppV4:
             intake["carbohydrate"] += float(r.get('炭水化物', 0) or 0)
             intake["salt"] += float(r.get('塩分', 0) or 0)
         return hist
+
+    def get_history_dataframe(self):
+        if not self.history_records: return None
+        df = pd.DataFrame(self.history_records)
+        df['日付'] = pd.to_datetime(df['日付'])
+        for col in ['カロリー', 'タンパク質', '脂質', '炭水化物', '塩分']:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        slot_order = {s: i for i, s in enumerate(self.slots)}
+        df['_slot_order'] = df['時間帯'].map(slot_order).fillna(99)
+        return df.sort_values(['日付', '_slot_order'], ascending=[False, True]).drop(columns='_slot_order').reset_index(drop=True)
 
     def trigger_refresh(self): st.session_state["clear_cache"] = True
 
@@ -356,7 +368,8 @@ total = {"calories":0.0,"protein":0.0,"fat":0.0,"carbohydrate":0.0,"salt":0.0}
 for s in app.slots:
     for k in total: total[k] += day_data["intake_by_slot"][s].get(k, 0.0)
 
-tab_main, tab_training, tab_graph = st.tabs(["📝 今日の記録・食事明細", "🏋️ トレーニング記録", "📈 トレンドグラフ"])
+tab_main, tab_meal_history, tab_graph, tab_training, tab_training_graph = st.tabs(
+    ["📝 食事記録", "📖 食事履歴", "⚖️ 体組成グラフ", "🏋️ トレーニング記録", "📈 トレーニンググラフ"])
 
 with tab_main:
     col1, col2 = st.columns([3, 2])
@@ -512,103 +525,112 @@ with tab_main:
                 st.success("✅ クラウドの目標値を更新しました！")
                 st.rerun()
 
+with tab_meal_history:
+    st.subheader("📖 食事履歴(日ごと・食事ごと)")
+    hist_df = app.get_history_dataframe()
+    if hist_df is not None and not hist_df.empty:
+        date_options = ["すべて"] + sorted(hist_df['日付'].dt.strftime('%Y-%m-%d').unique(), reverse=True)
+        sel_hist_date = st.selectbox("日付で絞り込み", date_options)
+        show_df = hist_df if sel_hist_date == "すべて" else hist_df[hist_df['日付'].dt.strftime('%Y-%m-%d') == sel_hist_date]
+        st.dataframe(show_df, use_container_width=True, hide_index=True)
+        st.caption(f"{len(show_df)}件の記録")
+    else:
+        st.info("まだ食事記録がありません。「食事記録」タブから記録してください。")
+
 with tab_training:
-    sub_input, sub_graph = st.tabs(["📝 記録入力", "📊 グラフ"])
+    st.subheader(f"🏋️ {sel_date} のトレーニング記録")
+    day_type = st.radio("今日のメニュー", ["A", "B"], horizontal=True,
+                         format_func=lambda d: f"Day {d}（" + "・".join(n for n, _ in TRAINING_PLAN[d]) + "）",
+                         key="train_day_type")
 
-    with sub_input:
-        st.subheader(f"🏋️ {sel_date} のトレーニング記録")
-        day_type = st.radio("今日のメニュー", ["A", "B"], horizontal=True,
-                             format_func=lambda d: f"Day {d}（" + "・".join(n for n, _ in TRAINING_PLAN[d]) + "）",
-                             key="train_day_type")
+    with st.form("training_log"):
+        inputs = {}
+        for ex_name, n_sets in TRAINING_PLAN[day_type]:
+            st.markdown(f"**{ex_name}**" + ("(回数のみ)" if ex_name in REPS_ONLY_EXERCISES else ""))
+            cols = st.columns(n_sets)
+            for i in range(n_sets):
+                with cols[i]:
+                    if ex_name in REPS_ONLY_EXERCISES:
+                        w = 0.0
+                        r = st.number_input(f"{i+1}セット目 回数", min_value=0, step=1,
+                                             key=f"r_{day_type}_{ex_name}_{i}")
+                    else:
+                        w = st.number_input(f"{i+1}セット目 重量(kg)", min_value=0.0, step=5.0,
+                                             key=f"w_{day_type}_{ex_name}_{i}")
+                        r = st.number_input(f"{i+1}セット目 回数", min_value=0, step=1,
+                                             key=f"r_{day_type}_{ex_name}_{i}")
+                    inputs[(ex_name, i + 1)] = (w, r)
+        if st.form_submit_button("この日のトレーニングを記録する", type="primary"):
+            entries = [
+                {"exercise": ex, "set_no": set_no, "weight": w, "reps": r}
+                for (ex, set_no), (w, r) in inputs.items() if w > 0 or r > 0
+            ]
+            if entries and app.log_training(sel_date, day_type, entries):
+                st.success("✅ トレーニングを記録しました！")
+                st.rerun()
+            elif not entries:
+                st.warning("重量か回数を1つ以上入力してください。")
 
-        with st.form("training_log"):
-            inputs = {}
-            for ex_name, n_sets in TRAINING_PLAN[day_type]:
-                st.markdown(f"**{ex_name}**" + ("(回数のみ)" if ex_name in REPS_ONLY_EXERCISES else ""))
-                cols = st.columns(n_sets)
-                for i in range(n_sets):
-                    with cols[i]:
-                        if ex_name in REPS_ONLY_EXERCISES:
-                            w = 0.0
-                            r = st.number_input(f"{i+1}セット目 回数", min_value=0, step=1,
-                                                 key=f"r_{day_type}_{ex_name}_{i}")
-                        else:
-                            w = st.number_input(f"{i+1}セット目 重量(kg)", min_value=0.0, step=5.0,
-                                                 key=f"w_{day_type}_{ex_name}_{i}")
-                            r = st.number_input(f"{i+1}セット目 回数", min_value=0, step=1,
-                                                 key=f"r_{day_type}_{ex_name}_{i}")
-                        inputs[(ex_name, i + 1)] = (w, r)
-            if st.form_submit_button("この日のトレーニングを記録する", type="primary"):
-                entries = [
-                    {"exercise": ex, "set_no": set_no, "weight": w, "reps": r}
-                    for (ex, set_no), (w, r) in inputs.items() if w > 0 or r > 0
-                ]
-                if entries and app.log_training(sel_date, day_type, entries):
-                    st.success("✅ トレーニングを記録しました！")
-                    st.rerun()
-                elif not entries:
-                    st.warning("重量か回数を1つ以上入力してください。")
+    st.markdown("---")
+    st.subheader("📋 記録の詳細(全種目)")
+    tr_df_all = app.get_training_dataframe()
+    if tr_df_all is not None and not tr_df_all.empty:
+        st.dataframe(tr_df_all.sort_values('日付', ascending=False), use_container_width=True, hide_index=True)
+    else:
+        st.info("まだトレーニング記録がありません。上のフォームから記録してください。")
+
+with tab_training_graph:
+    tr_df = app.get_training_dataframe()
+    # 表示順: Day A → Day B のメニュー順(重複なし)
+    ALL_EXERCISES = list(dict.fromkeys(
+        [n for n, _ in TRAINING_PLAN["A"]] + [n for n, _ in TRAINING_PLAN["B"]]
+    ))
+    ALL_MUSCLES = ["胸", "肩", "三頭", "背中", "二頭", "脚", "外転筋", "腹筋"]
+
+    st.subheader("📈 種目別・総負荷量の推移")
+    if tr_df is None or tr_df.empty:
+        st.info("まだトレーニング記録がありません。「トレーニング記録」タブから記録してください。")
+    else:
+        for i in range(0, len(ALL_EXERCISES), 2):
+            cols = st.columns(2)
+            for j, ex_name in enumerate(ALL_EXERCISES[i:i + 2]):
+                with cols[j]:
+                    st.markdown(f"**{ex_name}**")
+                    ex_df = tr_df[tr_df['種目'] == ex_name]
+                    if ex_df.empty:
+                        st.caption("記録なし")
+                        continue
+                    is_reps_only = ex_name in REPS_ONLY_EXERCISES
+                    daily_load = ex_df.groupby('日付')['総負荷量'].sum().reset_index()
+                    y_label = "総負荷量(回数)" if is_reps_only else "総負荷量(kg×回)"
+                    fig = px.line(daily_load, x='日付', y='総負荷量', markers=True, labels={"総負荷量": y_label})
+                    fig.update_layout(margin=dict(l=10, r=10, t=5, b=5), height=260)
+                    st.plotly_chart(fig, use_container_width=True, key=f"train_trend_{ex_name}")
 
         st.markdown("---")
-        st.subheader("📋 記録の詳細(全種目)")
-        tr_df_all = app.get_training_dataframe()
-        if tr_df_all is not None and not tr_df_all.empty:
-            st.dataframe(tr_df_all.sort_values('日付', ascending=False), use_container_width=True, hide_index=True)
+        st.subheader("📊 部位別・週単位の総負荷量")
+        st.caption("種目の総負荷量を、主働筋1.0・補助筋0.5の比率で各部位に按分し、週(月曜始まり)単位で合計しています。腹筋は回数ベースのため他部位と単位が異なる点にご注意ください。")
+        weekly = app.get_weekly_muscle_load(tr_df)
+        if weekly is None:
+            st.info("集計できるデータがまだありません。")
         else:
-            st.info("まだトレーニング記録がありません。上のフォームから記録してください。")
-
-    with sub_graph:
-        tr_df = app.get_training_dataframe()
-        # 表示順: Day A → Day B のメニュー順(重複なし)
-        ALL_EXERCISES = list(dict.fromkeys(
-            [n for n, _ in TRAINING_PLAN["A"]] + [n for n, _ in TRAINING_PLAN["B"]]
-        ))
-        ALL_MUSCLES = ["胸", "肩", "三頭", "背中", "二頭", "脚", "外転筋", "腹筋"]
-
-        st.subheader("📈 種目別・総負荷量の推移")
-        if tr_df is None or tr_df.empty:
-            st.info("まだトレーニング記録がありません。「記録入力」タブから記録してください。")
-        else:
-            for i in range(0, len(ALL_EXERCISES), 2):
+            weekly_disp = weekly.copy()
+            weekly_disp['週'] = weekly_disp['週'].dt.strftime('%Y-%m-%d') + "の週"
+            for i in range(0, len(ALL_MUSCLES), 2):
                 cols = st.columns(2)
-                for j, ex_name in enumerate(ALL_EXERCISES[i:i + 2]):
+                for j, muscle in enumerate(ALL_MUSCLES[i:i + 2]):
                     with cols[j]:
-                        st.markdown(f"**{ex_name}**")
-                        ex_df = tr_df[tr_df['種目'] == ex_name]
-                        if ex_df.empty:
+                        st.markdown(f"**{muscle}**")
+                        m_df = weekly_disp[weekly_disp['部位'] == muscle]
+                        if m_df.empty:
                             st.caption("記録なし")
                             continue
-                        is_reps_only = ex_name in REPS_ONLY_EXERCISES
-                        daily_load = ex_df.groupby('日付')['総負荷量'].sum().reset_index()
-                        y_label = "総負荷量(回数)" if is_reps_only else "総負荷量(kg×回)"
-                        fig = px.line(daily_load, x='日付', y='総負荷量', markers=True, labels={"総負荷量": y_label})
-                        fig.update_layout(margin=dict(l=10, r=10, t=5, b=5), height=260)
-                        st.plotly_chart(fig, use_container_width=True, key=f"train_trend_{ex_name}")
-
-            st.markdown("---")
-            st.subheader("📊 部位別・週単位の総負荷量")
-            st.caption("種目の総負荷量を、主働筋1.0・補助筋0.5の比率で各部位に按分し、週(月曜始まり)単位で合計しています。腹筋は回数ベースのため他部位と単位が異なる点にご注意ください。")
-            weekly = app.get_weekly_muscle_load(tr_df)
-            if weekly is None:
-                st.info("集計できるデータがまだありません。")
-            else:
-                weekly_disp = weekly.copy()
-                weekly_disp['週'] = weekly_disp['週'].dt.strftime('%Y-%m-%d') + "の週"
-                for i in range(0, len(ALL_MUSCLES), 2):
-                    cols = st.columns(2)
-                    for j, muscle in enumerate(ALL_MUSCLES[i:i + 2]):
-                        with cols[j]:
-                            st.markdown(f"**{muscle}**")
-                            m_df = weekly_disp[weekly_disp['部位'] == muscle]
-                            if m_df.empty:
-                                st.caption("記録なし")
-                                continue
-                            fig2 = px.line(m_df, x='週', y='負荷量', markers=True)
-                            fig2.update_layout(margin=dict(l=10, r=10, t=5, b=5), height=260)
-                            st.plotly_chart(fig2, use_container_width=True, key=f"weekly_muscle_{muscle}")
-                with st.expander("週別・部位別の数値を見る"):
-                    pivot = weekly_disp.pivot(index='週', columns='部位', values='負荷量').fillna(0).round(1)
-                    st.dataframe(pivot, use_container_width=True)
+                        fig2 = px.line(m_df, x='週', y='負荷量', markers=True)
+                        fig2.update_layout(margin=dict(l=10, r=10, t=5, b=5), height=260)
+                        st.plotly_chart(fig2, use_container_width=True, key=f"weekly_muscle_{muscle}")
+            with st.expander("週別・部位別の数値を見る"):
+                pivot = weekly_disp.pivot(index='週', columns='部位', values='負荷量').fillna(0).round(1)
+                st.dataframe(pivot, use_container_width=True)
 
 with tab_graph:
     body_df = app.get_body_dataframe()
