@@ -19,6 +19,19 @@ TRAINING_PLAN = {
     "A": [("チェストプレス", 3), ("ショルダープレス", 2), ("レッグプレス", 4), ("ディップス", 1), ("腹筋マシン", 2)],
     "B": [("ラットプルダウン", 4), ("アブダクション", 4), ("アームカール", 2), ("腹筋マシン", 2)],
 }
+# 重量を記録せず回数のみで管理する種目
+REPS_ONLY_EXERCISES = {"腹筋マシン"}
+# 各種目が効く部位と負荷の配分(主働筋1.0・補助筋0.5)。総負荷量を部位別に按分する際に使用
+MUSCLE_MAP = {
+    "チェストプレス": {"胸": 1.0, "三頭": 0.5, "肩": 0.5},
+    "ショルダープレス": {"肩": 1.0, "三頭": 0.5},
+    "ディップス": {"三頭": 1.0, "胸": 0.5, "肩": 0.5},
+    "ラットプルダウン": {"背中": 1.0, "二頭": 0.5},
+    "アームカール": {"二頭": 1.0},
+    "レッグプレス": {"脚": 1.0},
+    "アブダクション": {"外転筋": 1.0},
+    "腹筋マシン": {"腹筋": 1.0},
+}
 
 class UltimateSheetsDietAppV4:
     def __init__(self):
@@ -309,8 +322,23 @@ class UltimateSheetsDietAppV4:
         df = df.copy()
         df['日付'] = pd.to_datetime(df['日付'])
         for col in ['セット', '重量(kg)', '回数']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        # 総負荷量: 重量を扱う種目は 重量×回数、回数のみの種目(腹筋)は回数そのものを負荷量とする
+        df['総負荷量'] = df.apply(
+            lambda r: r['回数'] if r['種目'] in REPS_ONLY_EXERCISES else r['重量(kg)'] * r['回数'], axis=1)
         return df.sort_values('日付').reset_index(drop=True)
+
+    def get_weekly_muscle_load(self, df):
+        """部位別・週単位の総負荷量を集計して返す(週は月曜始まり)。"""
+        if df is None or df.empty: return None
+        week_start = df['日付'] - pd.to_timedelta(df['日付'].dt.weekday, unit='D')
+        recs = []
+        for (wk, load, ex) in zip(week_start, df['総負荷量'], df['種目']):
+            for muscle, ratio in MUSCLE_MAP.get(ex, {}).items():
+                recs.append({"週": wk, "部位": muscle, "負荷量": load * ratio})
+        if not recs: return None
+        m = pd.DataFrame(recs).groupby(["週", "部位"], as_index=False)["負荷量"].sum()
+        return m
 
 app = UltimateSheetsDietAppV4()
 
@@ -493,14 +521,19 @@ with tab_training:
     with st.form("training_log"):
         inputs = {}
         for ex_name, n_sets in TRAINING_PLAN[day_type]:
-            st.markdown(f"**{ex_name}**")
+            st.markdown(f"**{ex_name}**" + ("(回数のみ)" if ex_name in REPS_ONLY_EXERCISES else ""))
             cols = st.columns(n_sets)
             for i in range(n_sets):
                 with cols[i]:
-                    w = st.number_input(f"{i+1}セット目 重量(kg)", min_value=0.0, step=0.5,
-                                         key=f"w_{day_type}_{ex_name}_{i}")
-                    r = st.number_input(f"{i+1}セット目 回数", min_value=0, step=1,
-                                         key=f"r_{day_type}_{ex_name}_{i}")
+                    if ex_name in REPS_ONLY_EXERCISES:
+                        w = 0.0
+                        r = st.number_input(f"{i+1}セット目 回数", min_value=0, step=1,
+                                             key=f"r_{day_type}_{ex_name}_{i}")
+                    else:
+                        w = st.number_input(f"{i+1}セット目 重量(kg)", min_value=0.0, step=5.0,
+                                             key=f"w_{day_type}_{ex_name}_{i}")
+                        r = st.number_input(f"{i+1}セット目 回数", min_value=0, step=1,
+                                             key=f"r_{day_type}_{ex_name}_{i}")
                     inputs[(ex_name, i + 1)] = (w, r)
         if st.form_submit_button("この日のトレーニングを記録する", type="primary"):
             entries = [
@@ -514,19 +547,35 @@ with tab_training:
                 st.warning("重量か回数を1つ以上入力してください。")
 
     st.markdown("---")
-    st.subheader("📈 種目別・重量の推移")
+    st.subheader("📈 種目別・総負荷量の推移")
     tr_df = app.get_training_dataframe()
     if tr_df is not None and not tr_df.empty:
         ex_list = sorted(tr_df['種目'].unique())
         sel_ex = st.selectbox("種目を選択", ex_list)
         ex_df = tr_df[tr_df['種目'] == sel_ex]
-        # その日の最大重量(トップセット)を日付ごとに集計 → 漸進的過負荷の確認用
-        top_set = ex_df.groupby('日付')['重量(kg)'].max().reset_index()
-        fig = px.line(top_set, x='日付', y='重量(kg)', markers=True)
+        is_reps_only = sel_ex in REPS_ONLY_EXERCISES
+        # 総負荷量(重量×回数、腹筋は回数)を日付ごとに合計 → 漸進的過負荷の確認用
+        daily_load = ex_df.groupby('日付')['総負荷量'].sum().reset_index()
+        y_label = "総負荷量(回数)" if is_reps_only else "総負荷量(kg×回)"
+        fig = px.line(daily_load, x='日付', y='総負荷量', markers=True, labels={"総負荷量": y_label})
         fig.update_layout(margin=dict(l=10, r=10, t=5, b=5), height=300)
         st.plotly_chart(fig, use_container_width=True, key=f"train_trend_{sel_ex}")
         with st.expander("記録の詳細を見る"):
             st.dataframe(ex_df.sort_values('日付', ascending=False), use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.subheader("📊 部位別・週単位の総負荷量")
+        st.caption("種目の総負荷量を、主働筋1.0・補助筋0.5の比率で各部位に按分し、週(月曜始まり)単位で合計しています。腹筋は回数ベースのため他部位と単位が異なる点にご注意ください。")
+        weekly = app.get_weekly_muscle_load(tr_df)
+        if weekly is not None:
+            weekly_disp = weekly.copy()
+            weekly_disp['週'] = weekly_disp['週'].dt.strftime('%Y-%m-%d') + "の週"
+            fig2 = px.line(weekly_disp, x='週', y='負荷量', color='部位', markers=True)
+            fig2.update_layout(margin=dict(l=10, r=10, t=5, b=5), height=350)
+            st.plotly_chart(fig2, use_container_width=True, key="weekly_muscle_load")
+            with st.expander("週別・部位別の数値を見る"):
+                pivot = weekly_disp.pivot(index='週', columns='部位', values='負荷量').fillna(0).round(1)
+                st.dataframe(pivot, use_container_width=True)
     else:
         st.info("まだトレーニング記録がありません。上のフォームから記録してください。")
 
